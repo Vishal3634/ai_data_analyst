@@ -3,7 +3,6 @@ import re
 import json
 import base64
 import logging
-import sqlite3
 import traceback
 from io import BytesIO
 
@@ -15,25 +14,25 @@ import seaborn as sns
 
 from langchain_groq import ChatGroq
 from langchain_experimental.agents import create_pandas_dataframe_agent
-from langchain_community.utilities import SQLDatabase
-from langchain_community.agent_toolkits import create_sql_agent
 from dotenv import load_dotenv
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+# ── Keyword Lists ─────────────────────────────────────────────
 CHART_KEYWORDS = [
     "plot", "chart", "graph", "visualize", "visualise",
-    "show", "display", "draw", "distribution", "trend",
-    "bar", "line", "histogram", "pie", "scatter"
+    "draw", "distribution", "bar", "line", "histogram",
+    "pie", "scatter"
 ]
 
-SQL_KEYWORDS = [
-    "sql", "query", "select", "where", "group by",
-    "join", "sum", "count", "max", "min", "average",
-    "highest", "lowest", "top", "bottom", "total",
-    "which city", "which product", "which region"
+COMPLEX_KEYWORDS = [
+    "correlation", "growth", "trend over", "filter",
+    "compare", "month", "year", "percent", "rank",
+    "top 5", "top 10", "outlier", "rolling", "cumulative",
+    "group by", "pivot", "merge", "join", "between",
+    "duplicate", "missing", "null", "unique"
 ]
 
 
@@ -44,28 +43,67 @@ class DataAnalystAgent:
         if not self.groq_api_key:
             raise ValueError("GROQ_API_KEY not found! Please add it to your .env file")
 
-        # ✅ Faster model + reduced tokens for speed
         self.llm = ChatGroq(
             groq_api_key=self.groq_api_key,
             model_name="llama-3.1-8b-instant",
             temperature=0,
             max_tokens=1024
         )
-        logger.info("✅ DataAnalystAgent ready with Groq")
+        logger.info("✅ DataAnalystAgent ready with Groq llama-3.1-8b-instant")
 
+    # ── Router ────────────────────────────────────────────────
     def run(self, question: str, datasets: dict) -> dict:
         question_lower = question.lower()
-        is_chart = any(kw in question_lower for kw in CHART_KEYWORDS)
-        is_sql   = any(kw in question_lower for kw in SQL_KEYWORDS)
+
+        is_chart   = any(kw in question_lower for kw in CHART_KEYWORDS)
+        is_complex = any(kw in question_lower for kw in COMPLEX_KEYWORDS)
 
         if is_chart:
             return self._handle_chart_query(question, datasets)
-        elif is_sql:
-            return self._handle_sql_query(question, datasets)
+        elif is_complex:
+            return self._handle_agent_query(question, datasets)
         else:
-            return self._handle_pandas_query(question, datasets)
+            # Direct LLM handles all simple queries:
+            # count, sum, average, max, min, total, which city, etc.
+            return self._handle_direct_query(question, datasets)
 
-    def _handle_pandas_query(self, question: str, datasets: dict) -> dict:
+    # ── FAST: Direct LLM (simple + sql-style questions) ───────
+    def _handle_direct_query(self, question: str, datasets: dict) -> dict:
+        try:
+            df = list(datasets.values())[0]
+            summary = self._build_summary(df)
+
+            prompt = f"""You are an expert data analyst. Answer the question accurately using ONLY the dataset info below.
+
+Dataset Info:
+{summary}
+
+Question: {question}
+
+Rules:
+- Give a direct, concise answer
+- Use exact numbers from the data where available
+- No code, just plain text answer"""
+
+            response = self.llm.invoke(prompt)
+            return {
+                "answer": response.content.strip(),
+                "chart": None,
+                "query_type": "direct",
+                "sql_query": None
+            }
+
+        except Exception as e:
+            logger.error(f"Direct query error: {traceback.format_exc()}")
+            return {
+                "answer": f"Error: {str(e)}",
+                "chart": None,
+                "query_type": "direct",
+                "sql_query": None
+            }
+
+    # ── ACCURATE: Pandas Agent (complex questions only) ───────
+    def _handle_agent_query(self, question: str, datasets: dict) -> dict:
         try:
             df = list(datasets.values())[0]
 
@@ -75,9 +113,8 @@ class DataAnalystAgent:
                 verbose=True,
                 agent_type="zero-shot-react-description",
                 allow_dangerous_code=True,
-                max_iterations=8,               # ✅ balanced
-                max_execution_time=30,          # ✅ 30s timeout
-                early_stopping_method="generate" # ✅ clean stop
+                max_iterations=10,
+                handle_parsing_errors=True
             )
 
             result = agent.invoke({"input": question})
@@ -91,63 +128,19 @@ class DataAnalystAgent:
             }
 
         except Exception as e:
-            logger.error(f"Pandas agent error: {traceback.format_exc()}")
-            return {
-                "answer": f"Error analyzing data: {str(e)}",
-                "chart": None,
-                "query_type": "pandas",
-                "sql_query": None
-            }
+            logger.error(f"Agent query error: {traceback.format_exc()}")
+            # Fallback to direct LLM if agent fails
+            logger.info("Falling back to direct LLM...")
+            fallback = self._handle_direct_query(question, datasets)
+            fallback["query_type"] = "pandas_fallback"
+            return fallback
 
-    def _handle_sql_query(self, question: str, datasets: dict) -> dict:
-        db_path = "/tmp/temp_analysis.db"
-        sql_query_used = None
-
-        try:
-            conn = sqlite3.connect(db_path)
-
-            for filename, df in datasets.items():
-                table_name = (filename
-                              .replace(".csv", "")
-                              .replace("-", "_")
-                              .replace(" ", "_"))
-                df.to_sql(table_name, conn, if_exists="replace", index=False)
-
-            conn.close()
-
-            db = SQLDatabase.from_uri(f"sqlite:///{db_path}")
-            sql_agent = create_sql_agent(
-                llm=self.llm,
-                db=db,
-                verbose=True,
-                handle_parsing_errors=True,
-                max_iterations=8,               # ✅ balanced
-                max_execution_time=30,          # ✅ 30s timeout
-                early_stopping_method="generate" # ✅ clean stop
-            )
-
-            result = sql_agent.invoke({"input": question})
-            answer = result.get("output", str(result))
-
-            return {
-                "answer": answer,
-                "chart": None,
-                "query_type": "sql",
-                "sql_query": sql_query_used
-            }
-
-        except Exception as e:
-            logger.error(f"SQL agent error: {traceback.format_exc()}")
-            result = self._handle_pandas_query(question, datasets)
-            result["query_type"] = "pandas_fallback"
-            return result
-
+    # ── FAST: Chart query ─────────────────────────────────────
     def _handle_chart_query(self, question: str, datasets: dict) -> dict:
         df = list(datasets.values())[0]
 
         try:
-            column_prompt = f"""
-You are a data analyst. Given these DataFrame columns: {list(df.columns)}
+            column_prompt = f"""You are a data analyst. Given these DataFrame columns: {list(df.columns)}
 And this user request: "{question}"
 
 Respond ONLY with a valid JSON object (no markdown, no explanation):
@@ -161,8 +154,8 @@ Respond ONLY with a valid JSON object (no markdown, no explanation):
 Rules:
 - chart_type must be one of: bar, line, histogram, scatter, pie
 - x_column and y_column must EXACTLY match one of the column names above
-- For histogram set y_column to null
-"""
+- For histogram set y_column to null"""
+
             response = self.llm.invoke(column_prompt)
             raw = response.content.strip()
             raw = re.sub(r"```json|```", "", raw).strip()
@@ -222,26 +215,26 @@ Rules:
 
         except Exception as e:
             logger.error(f"Chart error: {traceback.format_exc()}")
-            result = self._handle_pandas_query(question, datasets)
-            result["query_type"] = "chart_fallback"
-            return result
+            fallback = self._handle_direct_query(question, datasets)
+            fallback["query_type"] = "chart_fallback"
+            return fallback
 
+    # ── Insights ──────────────────────────────────────────────
     def generate_insights(self, datasets: dict) -> list:
         insights = []
 
         for filename, df in datasets.items():
             try:
                 summary = self._build_summary(df)
-                prompt = f"""
-You are a senior business data analyst. Analyze this dataset and provide insights.
+                prompt = f"""You are a senior business data analyst. Analyze this dataset and provide insights.
 
 Dataset: {filename}
 {summary}
 
 Provide exactly 5 actionable business insights.
 Each insight must start with "•" and be 1-2 sentences.
-Return ONLY the 5 bullet points, nothing else.
-"""
+Return ONLY the 5 bullet points, nothing else."""
+
                 response = self.llm.invoke(prompt)
                 raw_insights = response.content.strip()
 
@@ -256,21 +249,30 @@ Return ONLY the 5 bullet points, nothing else.
 
         return insights if insights else ["No insights generated. Please check your data."]
 
+    # ── Rich Summary Builder ──────────────────────────────────
     def _build_summary(self, df: pd.DataFrame) -> str:
         parts = []
         parts.append(f"Shape: {df.shape[0]} rows x {df.shape[1]} columns")
         parts.append(f"Columns: {list(df.columns)}")
 
+        # Full value counts for ALL categorical columns
+        # This allows direct LLM to answer count queries accurately
+        cat_cols = df.select_dtypes(include="object").columns
+        for col in cat_cols:
+            counts = df[col].value_counts()
+            parts.append(f"Value counts for '{col}':\n{counts.to_string()}")
+
+        # Full numeric statistics
         numeric_df = df.select_dtypes(include="number")
         if not numeric_df.empty:
             stats = numeric_df.describe().round(2)
             parts.append(f"Numeric Statistics:\n{stats.to_string()}")
+            # Column totals for sum/total queries
+            parts.append(f"Column Totals:\n{numeric_df.sum().round(2).to_string()}")
+            # Column means for average queries
+            parts.append(f"Column Averages:\n{numeric_df.mean().round(2).to_string()}")
 
-        cat_cols = df.select_dtypes(include="object").columns
-        for col in list(cat_cols)[:3]:
-            top_vals = df[col].value_counts().head(5)
-            parts.append(f"Top values in '{col}': {top_vals.to_dict()}")
-
+        # Missing values
         missing = df.isnull().sum()
         if missing.any():
             parts.append(f"Missing values: {missing[missing > 0].to_dict()}")
