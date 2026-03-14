@@ -47,7 +47,7 @@ class DataAnalystAgent:
         # ✅ Faster model + reduced tokens for speed
         self.llm = ChatGroq(
             groq_api_key=self.groq_api_key,
-            model_name="llama3-8b-8192",
+            model_name="llama-3.1-8b-instant",
             temperature=0,
             max_tokens=1024
         )
