@@ -74,7 +74,9 @@ class DataAnalystAgent:
                 verbose=True,
                 agent_type="zero-shot-react-description",
                 allow_dangerous_code=True,
-                max_iterations=5
+                max_iterations=15,
+                max_execution_time=60,
+                early_stopping_method="generate"
             )
 
             result = agent.invoke({"input": question})
@@ -118,7 +120,9 @@ class DataAnalystAgent:
                 db=db,
                 verbose=True,
                 handle_parsing_errors=True,
-                max_iterations=5
+                max_iterations=15,
+                max_execution_time=60,
+                early_stopping_method="generate"
             )
 
             result = sql_agent.invoke({"input": question})
