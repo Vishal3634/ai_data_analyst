@@ -44,11 +44,12 @@ class DataAnalystAgent:
         if not self.groq_api_key:
             raise ValueError("GROQ_API_KEY not found! Please add it to your .env file")
 
+        # ✅ Faster model + reduced tokens for speed
         self.llm = ChatGroq(
             groq_api_key=self.groq_api_key,
-            model_name="llama-3.1-8b-instant",
+            model_name="llama3-8b-8192",
             temperature=0,
-            max_tokens=2048
+            max_tokens=1024
         )
         logger.info("✅ DataAnalystAgent ready with Groq")
 
@@ -74,9 +75,9 @@ class DataAnalystAgent:
                 verbose=True,
                 agent_type="zero-shot-react-description",
                 allow_dangerous_code=True,
-                max_iterations=15,
-                max_execution_time=60,
-                early_stopping_method="generate"
+                max_iterations=8,               # ✅ balanced
+                max_execution_time=30,          # ✅ 30s timeout
+                early_stopping_method="generate" # ✅ clean stop
             )
 
             result = agent.invoke({"input": question})
@@ -120,9 +121,9 @@ class DataAnalystAgent:
                 db=db,
                 verbose=True,
                 handle_parsing_errors=True,
-                max_iterations=15,
-                max_execution_time=60,
-                early_stopping_method="generate"
+                max_iterations=8,               # ✅ balanced
+                max_execution_time=30,          # ✅ 30s timeout
+                early_stopping_method="generate" # ✅ clean stop
             )
 
             result = sql_agent.invoke({"input": question})
